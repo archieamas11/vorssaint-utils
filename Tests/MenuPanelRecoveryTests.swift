@@ -52,6 +52,7 @@ enum MenuPanelRecoveryTests {
         func convert(_ rect: CGRect, to: Any?) -> CGRect { rect }
     }
     final class Popover {
+        var animates = true
         var isShown = false
         var contentViewController: Controller? = Controller()
         var fails = false
