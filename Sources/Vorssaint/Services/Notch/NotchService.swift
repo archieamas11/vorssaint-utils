@@ -20,8 +20,14 @@ struct NotchNotice: Equatable {
         let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
         let leading = ((level == nil ? title : detail) as NSString).size(withAttributes: [.font: font]).width
         let trailing = level == nil ? (detail as NSString).size(withAttributes: [.font: font]).width : 0
-        // Reserve the icon, spacing and both insets before limiting long names.
-        return min(240, max(112, ceil(max(leading + 18 + 8, trailing)) + 32))
+        // Reserve enough for the widest percentage without giving the short
+        // label the same oversized wing used by text notices.
+        if level != nil, event != .accessory { return 80 }
+        // Battery labels need breathing room at both the curved edge and the
+        // camera. Long accessory names still use bounded truncation.
+        let maximum: CGFloat = event == .accessory && level == nil ? 160 : 240
+        let padding: CGFloat = event == .battery ? 32 : 16
+        return min(maximum, max(88, ceil(max(leading + 18 + 8, trailing)) + padding))
     }
 
     var accessibilityText: String {
@@ -55,7 +61,9 @@ final class NotchService: ObservableObject {
     @Published private(set) var showingAppPanel = false
     @Published private(set) var showingSections = false
     @Published private(set) var sectionQuery = ""
-    @Published var highlightedSection: NotchModule?
+    @Published var highlightedSection: NotchModule? { didSet { revealHighlightedSection() } }
+    /// The gallery's first visible row; the rows above it have stepped away.
+    @Published private(set) var sectionRow = 0
     @Published private(set) var modules: [NotchModule] = []
     @Published private(set) var notice: NotchNotice?
     @Published private(set) var noticeExpanded = false
@@ -96,6 +104,12 @@ final class NotchService: ObservableObject {
     private var fileInteractionActive = false
     private var keepsWorkingSurface: Bool {
         pinned || trackingMenu || NSApp.modalWindow != nil || panel?.attachedSheet != nil
+            || NotchLyricsService.shared.isImporting
+            // Like the lyrics chooser, these panels stand beside the island
+            // instead of hanging from it; a click in them is not a click away.
+            || (expanded && MediaWorkspaceView.panelModalActive)
+            || (expanded && selected == .downloads && NotchDownloadService.shared.isChoosingFolder)
+            || (expanded && selected == .scratchpad && ScratchpadService.shared.modalInteractionActive)
             || (expanded && !showingSections && selected == .calendar && Permissions.shared.keepsCalendarPrompt)
             || (expanded && !showingSections && selected == .files && fileInteractionActive)
             || CameraPreviewService.shared.keepsNotchPermissionPrompt
@@ -108,6 +122,7 @@ final class NotchService: ObservableObject {
     private var hiddenInFullscreen = false
     private var settingsSignature = ""
     private var gesture = NotchGestureSupport()
+    private var sectionScroll = NotchSectionScroll()
     private var volumeBaseline: Double?
     private var muteBaseline: Bool?
     private var volumeDeviceUID: String?
@@ -172,7 +187,7 @@ final class NotchService: ObservableObject {
         let shortcuts = controls.filter { $0 != .volume && $0 != .brightness && $0 != .music }.count
         let musicExtras = NotchLyricsSupport.isEnabled() || NotchQueueSupport.isEnabled()
         let launcher = QuickLauncherService.shared
-        return geometry.expandedSize(module: showingAppPanel ? .tools : selected,
+        return expandedGeometry.expandedSize(module: showingAppPanel ? .tools : selected,
                                      detail: selectedMetric != nil, panel: showingAppPanel, shortcutCount: shortcuts,
                                      sliderCount: sliders, controlsHaveMusic: controls.contains(.music), musicHasContent: NotchMusicService.shared.playback != nil,
                                      musicHasControlsRow: AppFeature.mixer.isAvailable || musicExtras,
@@ -187,7 +202,14 @@ final class NotchService: ObservableObject {
                                      timerMode: NotchTimerService.shared.session.hasSession
                                         ? NotchTimerService.shared.session.mode : NotchTimerSupport.savedMode())
     }
-    var contentSize: CGSize { geometry.contentSize(for: expandedSize) }
+    var expandedGeometry: NotchGeometry {
+        var result = geometry
+        // Capture editing has a full toolbar whose actions must stay reachable.
+        result.requiresFullWidthHeader = selected == .captures && captureActions != nil
+            && !showingSections && !showingAppPanel && selectedMetric == nil
+        return result
+    }
+    var contentSize: CGSize { expandedGeometry.contentSize(for: expandedSize) }
     var usesGlassSurface: Bool {
         expanded || peeking || dragPlaceholder || noticeExpanded
             || (captureControls != nil && !captureControlsCollapsed)
@@ -332,6 +354,7 @@ final class NotchService: ObservableObject {
         musicDetailVisible = false
         panel?.handleScroll = nil
         gesture = NotchGestureSupport()
+        sectionScroll = NotchSectionScroll()
         stopMenuSpaceMonitoring()
         geometry.compactSideRoom = nil
         hoverWork?.cancel(); hoverWork = nil
@@ -360,6 +383,7 @@ final class NotchService: ObservableObject {
         showingSections = false
         sectionQuery = ""
         highlightedSection = nil
+        sectionRow = 0
         inside = false
         hoverState = NotchHoverState()
         openedByHover = false
@@ -441,6 +465,7 @@ final class NotchService: ObservableObject {
             showingSections = false
             sectionQuery = ""
             highlightedSection = nil
+            sectionRow = 0
         }
         panel?.acceptsKeyFocus = false
         panel?.resignKey()
@@ -598,10 +623,39 @@ final class NotchService: ObservableObject {
             open(appPanel: showingAppPanel, metric: selectedMetric)
         } else {
             sectionQuery = ""
+            // The gallery opens from its top, stepping only as far as the
+            // current section's row.
+            sectionRow = 0
             highlightedSection = selected
             open(appPanel: showingAppPanel, metric: selectedMetric, sections: true)
         }
     }
+
+    private var sectionRowLimits: (rows: Int, visible: Int) {
+        let count = filteredSections.count
+        return (NotchSectionPaging.rows(count: count, columns: geometry.sectionColumns), geometry.sectionRows(count: count))
+    }
+
+    /// Keyboard moves and search results keep the highlighted tile's row in
+    /// view, moving the gallery no further than that row needs.
+    private func revealHighlightedSection() {
+        guard let target = highlightedSection, let index = filteredSections.firstIndex(of: target) else { return }
+        let limits = sectionRowLimits
+        let row = NotchSectionPaging.revealing(row: index / max(1, geometry.sectionColumns), first: sectionRow,
+                                               rows: limits.rows, visible: limits.visible)
+        if row != sectionRow { sectionRow = row }
+    }
+
+    /// Rest the gallery on `row`, within the rows it has.
+    func showSectionRow(_ row: Int) {
+        let limits = sectionRowLimits
+        let next = NotchSectionPaging.clamped(row, rows: limits.rows, visible: limits.visible)
+        guard next != sectionRow else { return }
+        sectionRow = next
+        provideHapticFeedback()
+    }
+
+    func scrollSections(by rows: Int) { showSectionRow(sectionRow + rows) }
 
     private func handleSectionKey(_ event: NSEvent) -> Bool {
         guard showingSections,
@@ -696,8 +750,16 @@ final class NotchService: ObservableObject {
     /// The pad lives in the island when its page is on; otherwise the
     /// shortcut opens the floating pad as it always did.
     func openScratchpad() {
-        if modules.contains(.scratchpad) { open(.scratchpad) }
-        else { perform { ScratchpadService.shared.show() } }
+        if !showScratchpad() { perform { ScratchpadService.shared.show() } }
+    }
+
+    @discardableResult
+    func showScratchpad(toggle: Bool = false) -> Bool {
+        guard NotchSupport.routesScratchpad(), acceptsSystemFeedback else { return false }
+        if toggle, expanded, selected == .scratchpad, !showingAppPanel, !showingSections,
+           selectedMetric == nil, panel?.isKeyWindow == true { collapse() }
+        else { open(.scratchpad) }
+        return true
     }
 
     func openAppPanel(toggle: Bool = false) {
@@ -1151,21 +1213,25 @@ final class NotchService: ObservableObject {
         // Preferences can change computed dimensions without publishing a
         // service property. Update SwiftUI's layout along with the native host.
         if let windowHost, windowHost.targetSize != size { objectWillChange.send() }
-        windowHost?.present(size: size, geometry: geometry, animated: animated,
+        windowHost?.present(size: size, geometry: expanded ? expandedGeometry : geometry, animated: animated,
                             transitionContent: transitionContent,
                             quickAccess: expanded && captureControls == nil && !access.buttons.isEmpty ? access : nil,
                             revealFromHidden: captureControls == nil
                                 && UserDefaults.standard.bool(forKey: DefaultsKey.notchHideUntilHover)
                                 && UserDefaults.standard.bool(forKey: DefaultsKey.notchOpenOnHover),
                             usesGlass: usesGlassSurface)
+        // Closing can shrink the island away from a pointer that has not moved,
+        // with no boundary crossing to report it. Only a pointer still over the
+        // island may keep its next approach from opening it.
+        if windowHost?.containsHover(NSEvent.mouseLocation) != true { hoverState.update(pointerInside: false) }
         let activationRect: CGRect
         if captureControls != nil {
             activationRect = captureControlsCollapsed ? CGRect(origin: .zero, size: size) : .zero
         } else if notice != nil || dragPlaceholder {
             activationRect = .zero
         } else {
-            activationRect = (compactActivityIsVisible ? compactActivityGeometry : geometry)
-                .activationArea(in: size, hasHeader: expanded || peeking, compactActivity: compactActivityIsVisible)
+            activationRect = (expanded ? expandedGeometry : compactActivityIsVisible ? compactActivityGeometry : geometry)
+                .activationArea(in: size, hasHeader: expanded || peeking, compactActivity: compactActivityIsVisible, expandedHeader: expanded)
         }
         let text = FeatureStrings.notch(L10n.shared.language)
         windowHost?.setActivationArea(activationRect, title: expanded ? text.collapse : text.open,
@@ -1542,6 +1608,7 @@ final class NotchService: ObservableObject {
         let clicks: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
         if let token = NSEvent.addGlobalMonitorForEvents(matching: clicks, handler: { [weak self] _ in
             guard let self, !self.keepsWorkingSurface,
+                  self.windowHost?.contains(NSEvent.mouseLocation) != true,
                   (NSApp.delegate as? AppDelegate)?.isOverStatusItem(NSEvent.mouseLocation) != true,
                   !AssistiveKeyboard.ownsCocoaPoint(NSEvent.mouseLocation) else { return }
             self.collapse()
@@ -1574,10 +1641,11 @@ final class NotchService: ObservableObject {
             }
             if event.type == .keyDown, event.window === self.panel, self.selected == .tools, !self.showingAppPanel, !self.showingSections {
                 let launcher = QuickLauncherService.shared
-                // The rail fills columns; the editing grid keeps its rows.
+                // The rail reads across its rows until it scrolls; the
+                // editing grid keeps its own rows.
                 let flow: QuickToolsSupport.GridFlow = launcher.isEditing
                     ? .rows(columns: NotchSupport.toolColumns)
-                    : .columns(rows: self.geometry.toolRows(count: launcher.visibleItems.count))
+                    : self.geometry.toolFlow(count: launcher.visibleItems.count)
                 return launcher.handlePanelKey(event, flow: flow)
             }
             if event.type == .keyDown, event.window === self.panel, event.keyCode == 53 {
@@ -1590,6 +1658,7 @@ final class NotchService: ObservableObject {
             }
             if clicks.contains(NSEvent.EventTypeMask(rawValue: 1 << event.type.rawValue)),
                event.window !== self.panel, !self.keepsWorkingSurface,
+               self.windowHost?.contains(NSEvent.mouseLocation) != true,
                (NSApp.delegate as? AppDelegate)?.isOverStatusItem(NSEvent.mouseLocation) != true,
                !AssistiveKeyboard.ownsCocoaPoint(NSEvent.mouseLocation) { self.collapse() }
             return event
@@ -1597,12 +1666,36 @@ final class NotchService: ObservableObject {
     }
 
     private func syncGestures() {
-        guard NotchGestureSupport.isEnabled() else {
-            panel?.handleScroll = nil
-            gesture = NotchGestureSupport()
-            return
+        if !NotchGestureSupport.isEnabled() { gesture = NotchGestureSupport() }
+        panel?.handleScroll = { [weak self] event in self?.handleScroll(event) ?? false }
+    }
+
+    /// The gallery steps its rows from the wheel; every other scroll over the
+    /// island is a gesture candidate.
+    private func handleScroll(_ event: NSEvent) -> Bool {
+        handleSectionScroll(event) || handleGesture(event)
+    }
+
+    private func handleSectionScroll(_ event: NSEvent) -> Bool {
+        guard running, !suspended, expanded, showingSections, let panel, !trackingMenu,
+              event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty else {
+            sectionScroll = NotchSectionScroll()
+            return false
         }
-        panel?.handleScroll = { [weak self] event in self?.handleGesture(event) ?? false }
+        let screenPoint = panel.convertPoint(toScreen: event.locationInWindow)
+        // The header keeps its own gesture; the tiles and the rest of the body step rows.
+        guard windowHost?.containsSurface(screenPoint) == true,
+              panel.frame.maxY - screenPoint.y > expandedGeometry.headerTopInset + expandedGeometry.headerRowHeight else {
+            sectionScroll = NotchSectionScroll()
+            return false
+        }
+        let steps = sectionScroll.steps(deltaY: Double(event.scrollingDeltaY), timestamp: event.timestamp,
+                                        precise: event.hasPreciseScrollingDeltas, hasPhase: !event.phase.isEmpty,
+                                        began: event.phase.contains(.began),
+                                        ended: !event.phase.intersection([.ended, .cancelled]).isEmpty,
+                                        momentum: !event.momentumPhase.isEmpty)
+        if steps != 0 { scrollSections(by: steps) }
+        return true
     }
 
     private func handleGesture(_ event: NSEvent) -> Bool {
@@ -1616,7 +1709,8 @@ final class NotchService: ObservableObject {
         guard windowHost?.contains(screenPoint) == true else { gesture = NotchGestureSupport(); return false }
         let fromTop = panel.frame.maxY - screenPoint.y
         let inHeader = NotchSupport.gestureIsOverHeader(expanded: expanded, peeking: peeking,
-                                                       fromTop: fromTop, safeTop: geometry.safeContentTop)
+                                                       fromTop: fromTop, safeTop: expanded ? expandedGeometry.headerTopInset : geometry.safeContentTop,
+                                                       height: expanded ? expandedGeometry.headerRowHeight : NotchLayout.headerHeight)
         let interaction = NotchGestureSupport.nativeInteraction(at: panel.contentView?.hitTest(event.locationInWindow))
         let musicSurface = modules.contains(.music)
             && (compactMusicIsVisible || (expanded && selected == .music && !showingAppPanel && !showingSections))
@@ -1770,9 +1864,7 @@ final class NotchService: ObservableObject {
     }
 
     private func showVolume(_ volume: Double, muted: Bool?) {
-        // The open panel already shows the adjustment. Do not retain a notice
-        // behind it that would appear only after the pointer leaves.
-        guard volume.isFinite, !expanded else { return }
+        guard volume.isFinite else { return }
         let value = muted == true ? 0 : min(1, max(0, volume))
         show(NotchNotice(event: .volume, title: FeatureStrings.notch(L10n.shared.language).volume,
                          detail: "\(Int((value * 100).rounded()))%",
