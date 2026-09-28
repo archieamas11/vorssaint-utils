@@ -418,12 +418,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
 
     // MARK: - Main panel
 
+    private var nativePopoverAnimationEnabled: Bool {
+        // On macOS 15, AppKit can leave full-size hosted content offset after
+        // the native transition. Keep the pre-3.4 presentation there.
+        if #available(macOS 26, *) { return true }
+        return false
+    }
+
     private func setUpPopover() {
         // Application-defined (not .transient) so the panel stays open while the
         // user works in our own Settings window and sees changes live. Click
         // monitors below dismiss it when it would block that same Settings window.
         popover.behavior = .applicationDefined
-        popover.animates = true
+        popover.animates = nativePopoverAnimationEnabled
         // The panel paints its own glass surface, or the arrow tip would show plain
         // system material where the surface stops, the seam users see. The visible
         // content stays inset either way, before through the content view's frame
@@ -508,7 +515,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         popover.animates = false
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         MenuPanelFocus.shared.setPopoverVisible(popover.isShown)
-        popover.animates = true
+        popover.animates = nativePopoverAnimationEnabled
         popover.contentViewController?.view.window?.makeKey()
         if let window = popover.contentViewController?.view.window {
             configurePopoverWindow(window)
@@ -855,7 +862,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
                      of: positioningView,
                      preferredEdge: .minY)
         MenuPanelFocus.shared.setPopoverVisible(popover.isShown)
-        popover.animates = true
+        popover.animates = nativePopoverAnimationEnabled
         guard popover.isShown,
               let popoverWindow = popover.contentViewController?.view.window else {
             endPopoverDriftCorrection()
@@ -917,7 +924,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         popoverIsClosing = true
         popover.animates = false
         popover.close()
-        popover.animates = true
+        popover.animates = nativePopoverAnimationEnabled
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self, weak button] in
             guard let self else {
                 MenuPanelFocus.shared.setSwitchingMetricAnchor(false)
@@ -964,7 +971,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         MenuPanelFocus.shared.setPopoverVisible(popover.isShown)
         if !animate {
-            popover.animates = true
+            popover.animates = nativePopoverAnimationEnabled
         }
         if let window = popover.contentViewController?.view.window {
             configurePopoverWindow(window)
@@ -1148,12 +1155,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         guard !popoverIsClosing else { return }
 
         popoverIsClosing = true
-        if animated {
+        if animated && nativePopoverAnimationEnabled {
             popover.performClose(nil)
         } else {
             popover.animates = false
             popover.close()
-            popover.animates = true
+            popover.animates = nativePopoverAnimationEnabled
         }
     }
 

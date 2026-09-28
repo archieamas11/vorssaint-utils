@@ -148,6 +148,7 @@ enum MenuPanelRecoveryTests {
     }
     class Fixture {
         let popover = Popover()
+        var nativePopoverAnimationEnabled = true
         let statusController = StatusController()
         var popoverIsClosing = false
         var popoverCloseIsAppRequested = false
@@ -455,6 +456,17 @@ enum MenuPanelRecoveryTests {
             requestClose(host, reason)
             expect(!host.popover.isShown && host.handbackReasons == [reason] && !host.activationTracking,
                    "a \(reason) close ends activation tracking and passes its reason to the handback")
+        }
+        do {
+            let host = setup(present: false)
+            host.nativePopoverAnimationEnabled = false
+            host.popover.animates = false
+            host.showPopover(activate: false)
+            expect(host.popover.isShown && !host.popover.animates,
+                   "older macOS keeps native popover animation disabled when opening")
+            host.closePopoverNow(animated: true, reason: .escape, completion: nil)
+            expect(!host.popover.isShown && !host.popover.animates,
+                   "older macOS closes without native animation and keeps it disabled")
         }
         do {
             let host = setup()
